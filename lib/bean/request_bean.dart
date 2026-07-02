@@ -107,3 +107,18 @@ class VersionRequest with _$VersionRequest implements WhisperRequestDto {
     });
   }
 }
+
+/// Request to free the natively cached whisper context.
+class ReleaseModelRequest implements WhisperRequestDto {
+  const ReleaseModelRequest();
+
+  @override
+  String get specialType => "releaseModel";
+
+  @override
+  String toRequestString() {
+    return json.encode({
+      "@type": specialType,
+    });
+  }
+}
