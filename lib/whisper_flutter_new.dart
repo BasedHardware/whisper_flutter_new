@@ -73,8 +73,9 @@ class Whisper {
 
   Future<Map<String, dynamic>> _request({
     required WhisperRequestDto whisperRequest,
+    bool ensureModel = true,
   }) async {
-    if (model != WhisperModel.none) {
+    if (ensureModel && model != WhisperModel.none) {
       await _initModel();
     }
     return Isolate.run(
@@ -119,6 +120,19 @@ class Whisper {
       throw Exception(result["message"]);
     }
     return WhisperTranscribeResponse.fromJson(result);
+  }
+
+  /// Free the natively cached model context.
+  ///
+  /// The native side keeps the model loaded between [transcribe] calls to
+  /// avoid paying the multi-second model load on every request. Call this
+  /// when transcription is done to reclaim the memory; the next
+  /// [transcribe] transparently reloads the model.
+  Future<void> releaseModel() async {
+    await _request(
+      whisperRequest: const ReleaseModelRequest(),
+      ensureModel: false,
+    );
   }
 
   /// Get whisper version

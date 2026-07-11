@@ -5,6 +5,7 @@
 #include "whisper.cpp/examples/dr_wav.h"
 
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -73,6 +74,48 @@ struct whisper_print_user_data
     const std::vector<std::vector<float>> *pcmf32s;
 };
 
+// The whisper context is cached between requests: loading a ggml model from
+// disk costs seconds on mobile, which dwarfs inference for the short audio
+// chunks sent by callers doing near-real-time transcription. The cache is
+// process-global, so it also survives the short-lived Dart isolates that the
+// plugin spawns per request.
+static std::mutex g_whisper_mutex;
+static struct whisper_context *g_whisper_ctx = nullptr;
+static std::string g_whisper_model_path;
+
+// Requires g_whisper_mutex to be held by the caller.
+static struct whisper_context *acquire_whisper_context(const std::string &model_path)
+{
+    if (g_whisper_ctx != nullptr && g_whisper_model_path == model_path)
+    {
+        return g_whisper_ctx;
+    }
+    if (g_whisper_ctx != nullptr)
+    {
+        whisper_free(g_whisper_ctx);
+        g_whisper_ctx = nullptr;
+        g_whisper_model_path.clear();
+    }
+    struct whisper_context *ctx = whisper_init_from_file(model_path.c_str());
+    if (ctx != nullptr)
+    {
+        g_whisper_ctx = ctx;
+        g_whisper_model_path = model_path;
+    }
+    return ctx;
+}
+
+static void release_whisper_context()
+{
+    std::lock_guard<std::mutex> lock(g_whisper_mutex);
+    if (g_whisper_ctx != nullptr)
+    {
+        whisper_free(g_whisper_ctx);
+        g_whisper_ctx = nullptr;
+        g_whisper_model_path.clear();
+    }
+}
+
 json transcribe(json jsonBody) noexcept
 {
     whisper_params params;
@@ -101,8 +144,16 @@ json transcribe(json jsonBody) noexcept
         params.seed = time(NULL);
     }
 
-    // whisper init
-    struct whisper_context *ctx = whisper_init_from_file(params.model.c_str());
+    // whisper init - the context is cached and reused across requests, and
+    // whisper_full mutates it, so the whole transcription is serialized.
+    std::lock_guard<std::mutex> ctx_lock(g_whisper_mutex);
+    struct whisper_context *ctx = acquire_whisper_context(params.model);
+    if (ctx == nullptr)
+    {
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = "failed to load model: " + params.model;
+        return jsonResult;
+    }
     std::string text_result = "";
     const auto fname_inp = params.audio;
     // WAV input
@@ -235,8 +286,7 @@ json transcribe(json jsonBody) noexcept
         }
     }
     jsonResult["text"] = text_result;
-    
-    whisper_free(ctx);
+
     return jsonResult;
 }
 extern "C"
@@ -266,6 +316,13 @@ extern "C"
             {
                 jsonResult["@type"] = "version";
                 jsonResult["message"] = "lib version: v1.0.1";
+                return jsonToChar(jsonResult);
+            }
+            if (jsonBody["@type"] == "releaseModel")
+            {
+                release_whisper_context();
+                jsonResult["@type"] = "releaseModel";
+                jsonResult["message"] = "released";
                 return jsonToChar(jsonResult);
             }
 
